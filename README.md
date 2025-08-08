@@ -1,40 +1,4 @@
-# System Architecture (High Level)
-
-```mermaid
-flowchart LR
-  subgraph Client/Lab
-    U[Users / Integrations] -- API --> GW[(API Gateway)]
-  end
-
-  subgraph Control Plane
-    GW --> AUTH[AuthN/Z (OIDC + RLS)]
-    GW --> JOBQ[(Ingestion Queue)]
-    GW --> RETRIEVER[Retrieval API]
-  end
-
-  subgraph Ingestion Plane
-    JOBQ --> PARSE[Document Parser<br/>PDF→JSON (text/tables/images)]
-    PARSE --> CLEAN[Cleaner/Deduper/Boilerplate stripper]
-    CLEAN --> SEG[Hierarchy Builder<br/>TOC/Headings/Sections]
-    SEG --> HYDRATE[Metadata Hydration<br/>summaries,tags,captioning]
-    HYDRATE --> EMB[Embedding Service]
-    EMB --> DB[(Postgres + pgvector)]
-    PARSE --> OBJ[(Object Storage: S3/GCS)]
-  end
-
-  subgraph Retrieval Plane
-    RETRIEVER --> INTENT[Intent Router]
-    INTENT --> CANDIDATE[Candidate Selector<br/>(instrument/lab scoping)]
-    CANDIDATE --> HYBRID[Hybrid Search<br/>BM25 + vector + filters]
-    HYBRID --> RERANK[Reranker (LLM/ML optional)]
-    RERANK --> QUOTE[Citation Stitcher<br/>(page, bbox)]
-    QUOTE --> LLM[Answer Synthesizer (JSON schema)]
-    LLM --> GW
-  end
-
-  DB <---> ANALYTICS[(Observability & Eval)]
-  GW --> CACHE[(Results Cache)]
-```
+# RAG System Design
 
 **Core tech choices (with rationale):**
 

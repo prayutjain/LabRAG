@@ -210,7 +210,7 @@ intent_classification:
 
 ### Vector Search
 - Use pgvector extension for similarity search
-- Store embeddings as `vector(1536)` for OpenAI ada-002
+- Store embeddings as `vector(3072)` for OpenAI text-embedding-3-large
 - Index with HNSW for performance
 
 ## Security & Isolation
@@ -250,4 +250,5 @@ intent_classification:
 - Query processing times
 - Confidence score distributions
 - Citation accuracy metrics
+
 - User satisfaction feedback

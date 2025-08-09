@@ -2,7 +2,7 @@
 
 ## System Overview
 
-This document provides comprehensive specifications for implementing a production-ready Retrieval-Augmented Generation (RAG) system designed specifically for laboratory instrument manuals and protocols. The system manages **30 laboratories**, up to **100 instruments per lab**, and up to **50 manuals per instrument** (2-20MB each), providing intelligent query responses with accurate citations and safety awareness.
+This document provides comprehensive specifications for implementing a production-ready Retrieval-Augmented Generation (RAG) system designed specifically for laboratory instrument manuals and protocols. The system manages multiple labs and their data separately, with up to **100 instruments per lab**, and up to **50 manuals per instrument** (2-20MB each), providing intelligent query responses with accurate citations and safety awareness.
 
 ## 🔧 Core Technology Stack
 
@@ -67,6 +67,7 @@ This document provides comprehensive specifications for implementing a productio
 **Purpose**: Intelligent query processing with context-aware responses and accurate citations.
 
 **Key Features:**
+- Quick keyword search uses PostgreSQL's full-text search capabilities
 - Intent classification (troubleshooting, operation, safety, etc.)
 - Hybrid retrieval combining vector similarity and keyword matching
 - Multi-modal query support (text + images)

@@ -265,81 +265,202 @@ class IntentClassifier:
         return IntentResult(**{k: v for k, v in result.items() if k != 'reasoning'})
 
 # src/agents/target_identifier.py
-class TargetIdentifier:
-    ```
-    Implement using LLM by finding the closest match to instruments in database
-    ```
+from typing import Dict, List, Any, Optional
+import openai
+import json
 
-    def __init__(self, database_pool):
+class TargetIdentifier:
+    def __init__(self, database_pool, openai_api_key: str):
         self.db_pool = database_pool
+        self.client = openai.OpenAI(api_key=openai_api_key)
     
     async def identify_targets(self, processed_query: ProcessedQuery, intent: IntentResult, lab_id: str) -> Dict[str, Any]:
-        """Identify specific instruments, documents, and contexts relevant to the query"""
+        """Enhanced target identification with LLM matching"""
         
         async with self.db_pool.acquire() as conn:
-            # Get lab instruments
-            lab_instruments = await conn.fetch("""
-                SELECT i.id, i.model_name, i.serial_number, m.name as manufacturer
-                FROM instruments i
-                JOIN manufacturers m ON i.manufacturer_id = m.id
-                WHERE i.lab_asset_id = ANY(
-                    SELECT unnest(string_to_array($1, ','))
-                ) OR $2 IS NULL
-            """, lab_id, lab_id)
+            # Get available instruments and documents
+            lab_instruments = await self._get_lab_instruments(conn, lab_id)
+            lab_documents = await self._get_lab_documents(conn, lab_id, intent)
             
-            # Match entities to instruments
-            relevant_instruments = []
-            detected_instruments = processed_query.detected_entities.get('instruments', [])
+            # LLM-powered instrument matching
+            relevant_instruments = await self._llm_match_instruments(
+                processed_query, lab_instruments
+            )
             
-            for instrument in lab_instruments:
-                if any(entity.lower() in instrument['model_name'].lower() 
-                      for entity in detected_instruments):
-                    relevant_instruments.append(instrument)
-            
-            # If no specific instruments identified, include all lab instruments
-            if not relevant_instruments and lab_id:
-                relevant_instruments = list(lab_instruments)
-            
-            # Get relevant document types based on intent
-            document_priorities = self._get_document_priorities(intent.primary_intent)
-            
-            # Get recent lab documents for these instruments
-            lab_documents = await conn.fetch("""
-                SELECT ld.*, array_agg(i.model_name) as instrument_models
-                FROM lab_documents ld
-                JOIN unnest(ld.instrument_ids) AS instrument_id ON true
-                JOIN instruments i ON i.id = instrument_id::uuid
-                WHERE ld.lab_id = $1 
-                AND ld.approval_status = 'approved'
-                AND ld.document_type = ANY($2)
-                GROUP BY ld.id
-                ORDER BY ld.updated_at DESC
-                LIMIT 20
-            """, lab_id, document_priorities[:3])
+            # LLM-powered document matching  
+            relevant_documents = await self._llm_match_documents(
+                processed_query, intent, lab_documents, relevant_instruments
+            )
             
             return {
-                "relevant_instruments": [dict(r) for r in relevant_instruments],
-                "relevant_lab_documents": [dict(r) for r in lab_documents],
-                "document_priorities": document_priorities,
-                "search_scope": {
-                    "lab_specific": bool(lab_id),
-                    "manufacturer_docs": True,
-                    "max_instruments": 5
-                }
+                "relevant_instruments": relevant_instruments,
+                "relevant_lab_documents": relevant_documents,
+                "document_priorities": self._get_document_priorities(intent.primary_intent),
+                "search_scope": self._determine_search_scope(relevant_instruments, lab_id)
             }
+    
+    async def _llm_match_instruments(self, processed_query: ProcessedQuery, instruments: List[Dict]) -> List[Dict]:
+        """Use LLM to match query to instruments"""
+        if not instruments:
+            return []
+        
+        # Prepare context - limit to prevent token overflow
+        instrument_list = [
+            f"{i['name']} {i['model_name']} (Serial: {i['serial_number']})"
+            for i in instruments[:20]
+        ]
+        
+        prompt = f"""
+        Match this lab query to relevant instruments:
+        Query: "{processed_query.original_text}"
+        Keywords: {processed_query.extracted_keywords}
+        
+        Available instruments:
+        {chr(10).join(f"{idx+1}. {instr}" for idx, instr in enumerate(instrument_list))}
+        
+        Return JSON with matched instrument indices (1-based) and confidence scores:
+        {{"matches": [{{"index": 1, "confidence": 0.9, "reason": "HPLC keyword matches"}}, ...]}}
+        
+        Match partial names, abbreviations, and synonyms. Return top 3 matches.
+        """
+        
+        try:
+            response = await self.client.chat.completions.create(
+                model="gpt-4",
+                messages=[{"role": "user", "content": prompt}],
+                response_format={"type": "json_object"},
+                temperature=0.1
+            )
+            
+            result = json.loads(response.choices[0].message.content)
+            matched_instruments = []
+            
+            for match in result.get("matches", []):
+                idx = match["index"] - 1  # Convert to 0-based
+                if 0 <= idx < len(instruments):
+                    instr = dict(instruments[idx])
+                    instr["match_confidence"] = match["confidence"]
+                    instr["match_reason"] = match["reason"]
+                    matched_instruments.append(instr)
+            
+            return matched_instruments
+            
+        except Exception:
+            # Fallback: simple keyword matching
+            return self._fallback_instrument_match(processed_query, instruments)
+    
+    async def _llm_match_documents(self, processed_query: ProcessedQuery, intent: IntentResult, 
+                                  documents: List[Dict], matched_instruments: List[Dict]) -> List[Dict]:
+        """Use LLM to match query to documents"""
+        if not documents:
+            return []
+        
+        # Prepare context
+        doc_list = [f"{doc['document_type']}: {doc['title']}" for doc in documents[:15]]
+        matched_models = [instr.get('model_name', '') for instr in matched_instruments[:3]]
+        
+        prompt = f"""
+        Select relevant documents for this lab query:
+        Query: "{processed_query.original_text}"
+        Intent: {intent.primary_intent}
+        Matched instruments: {matched_models}
+        
+        Available documents:
+        {chr(10).join(f"{idx+1}. {doc}" for idx, doc in enumerate(doc_list))}
+        
+        Return JSON with document indices and relevance scores:
+        {{"matches": [{{"index": 1, "relevance": 0.8}}, ...]}}
+        
+        Prioritize documents matching the intent and instrument types. Return top 5.
+        """
+        
+        try:
+            response = await self.client.chat.completions.create(
+                model="gpt-4", 
+                messages=[{"role": "user", "content": prompt}],
+                response_format={"type": "json_object"},
+                temperature=0.1
+            )
+            
+            result = json.loads(response.choices[0].message.content)
+            matched_docs = []
+            
+            for match in result.get("matches", []):
+                idx = match["index"] - 1
+                if 0 <= idx < len(documents):
+                    doc = dict(documents[idx])
+                    doc["relevance_score"] = match["relevance"]
+                    matched_docs.append(doc)
+            
+            return matched_docs
+            
+        except Exception:
+            # Fallback: return documents matching intent priorities
+            priorities = self._get_document_priorities(intent.primary_intent)
+            return [doc for doc in documents if doc['document_type'] in priorities[:3]][:5]
+    
+    def _fallback_instrument_match(self, processed_query: ProcessedQuery, instruments: List[Dict]) -> List[Dict]:
+        """Simple keyword fallback for instrument matching"""
+        keywords = [kw.lower() for kw in processed_query.extracted_keywords]
+        matches = []
+        
+        for instr in instruments:
+            score = 0
+            model_lower = instr['model_name'].lower()
+            manufacturer_lower = instr['name'].lower()
+            
+            for keyword in keywords:
+                if keyword in model_lower:
+                    score += 0.8
+                elif keyword in manufacturer_lower:
+                    score += 0.5
+            
+            if score > 0:
+                instr_copy = dict(instr)
+                instr_copy["match_confidence"] = min(score, 1.0)
+                matches.append(instr_copy)
+        
+        return sorted(matches, key=lambda x: x["match_confidence"], reverse=True)[:3]
+    
+    def _determine_search_scope(self, matched_instruments: List[Dict], lab_id: str) -> Dict[str, Any]:
+        """Determine search strategy based on matches"""
+        return {
+            "lab_specific": bool(lab_id),
+            "manufacturer_docs": True,
+            "max_instruments": len(matched_instruments) if matched_instruments else 5,
+            "expand_search": len(matched_instruments) == 0  # Expand if no matches
+        }
+    
+    async def _get_lab_instruments(self, conn, lab_id: str) -> List[Dict]:
+        """Get lab instruments from database"""
+        return await conn.fetch("""
+            SELECT i.id, i.model_name, i.serial_number, m.name
+            FROM instruments i
+            JOIN manufacturers m ON i.manufacturer_id = m.id
+            WHERE i.lab_asset_id = ANY(string_to_array($1, ',')) OR $1 IS NULL
+        """, lab_id)
+    
+    async def _get_lab_documents(self, conn, lab_id: str, intent: IntentResult) -> List[Dict]:
+        """Get relevant lab documents"""
+        return await conn.fetch("""
+            SELECT ld.id, ld.title, ld.document_type, ld.summary
+            FROM lab_documents ld
+            WHERE ld.lab_id = $1 AND ld.approval_status = 'approved'
+            ORDER BY ld.updated_at DESC LIMIT 20
+        """, lab_id)
     
     def _get_document_priorities(self, intent: str) -> List[str]:
         """Get prioritized document types based on intent"""
         priority_map = {
-            "troubleshooting": ["troubleshooting_guide", "sop", "maintenance_manual", "operational_guide"],
-            "operation": ["operational_guide", "sop", "protocol", "software_guide"],
-            "maintenance": ["maintenance_manual", "sop", "safety_document", "operational_guide"],
-            "safety": ["safety_document", "sop", "troubleshooting_guide", "operational_guide"],
-            "parameter_lookup": ["technical_specification", "operational_guide", "software_guide"],
-            "protocol_guidance": ["protocol", "sop", "method_validation", "operational_guide"],
-            "general_info": ["operational_guide", "technical_specification", "installation_guide"]
+            "troubleshooting": ["troubleshooting_guide", "sop", "maintenance_manual"],
+            "operation": ["operational_guide", "sop", "protocol"],
+            "maintenance": ["maintenance_manual", "sop", "safety_document"],
+            "safety": ["safety_document", "sop", "troubleshooting_guide"],
+            "parameter_lookup": ["technical_specification", "operational_guide"],
+            "protocol_guidance": ["protocol", "sop", "method_validation"],
+            "general_info": ["operational_guide", "technical_specification"]
         }
-        return priority_map.get(intent, ["operational_guide", "sop", "troubleshooting_guide"])
+        return priority_map.get(intent, ["operational_guide", "sop"])
 ```
 
 ### Hybrid Retrieval System
@@ -550,6 +671,87 @@ class HybridRetriever:
             result.relevance_score = min(score, 1.0)
         
         return sorted(results, key=lambda x: x.relevance_score, reverse=True)
+
+    async def quick_keyword_search(self, keywords: List[str], lab_id: Optional[str] = None, 
+                                max_results: int = 10) -> List[RetrievalResult]:
+        """Perform fast keyword-based search without embedding generation"""
+        
+        async with self.db_pool.acquire() as conn:
+            # Build keyword query for full-text search
+            keyword_query = " | ".join(keywords)  # PostgreSQL full-text search OR operator
+            
+            # Search manufacturer documents
+            manufacturer_results = await conn.fetch("""
+                SELECT 
+                    mc.id,
+                    mc.content,
+                    mc.metadata,
+                    mc.page_references,
+                    mc.image_refs,
+                    md.title as document_title,
+                    ms.title as section_title,
+                    ts_rank(mc.search_vector, plainto_tsquery($1)) as rank_score
+                FROM manufacturer_chunks mc
+                JOIN manufacturer_documents md ON mc.document_id = md.id
+                JOIN manufacturer_sections ms ON mc.section_id = ms.id
+                WHERE mc.search_vector @@ plainto_tsquery($1)
+                ORDER BY rank_score DESC
+                LIMIT $2
+            """, keyword_query, max_results // 2)
+            
+            # Search lab documents if lab_id provided
+            lab_results = []
+            if lab_id:
+                lab_results = await conn.fetch("""
+                    SELECT 
+                        lc.id,
+                        lc.content,
+                        lc.metadata,
+                        lc.page_references,
+                        lc.image_refs,
+                        ld.title as document_title,
+                        ls.title as section_title,
+                        ts_rank(lc.search_vector, plainto_tsquery($1)) as rank_score
+                    FROM lab_chunks lc
+                    JOIN lab_documents ld ON lc.document_id = ld.id
+                    JOIN lab_sections ls ON lc.section_id = ls.id
+                    WHERE lc.search_vector @@ plainto_tsquery($1)
+                    AND ld.lab_id = $3
+                    ORDER BY rank_score DESC
+                    LIMIT $2
+                """, keyword_query, max_results // 2, lab_id)
+            
+            # Convert to RetrievalResult objects
+            all_results = []
+            
+            for r in manufacturer_results:
+                all_results.append(RetrievalResult(
+                    chunk_id=str(r['id']),
+                    content=r['content'],
+                    source_type='manufacturer',
+                    document_title=r['document_title'],
+                    section_title=r['section_title'],
+                    relevance_score=float(r['rank_score']),
+                    metadata=r['metadata'] or {},
+                    page_references=r['page_references'] or [],
+                    image_refs=r['image_refs'] or []
+                ))
+            
+            for r in lab_results:
+                all_results.append(RetrievalResult(
+                    chunk_id=str(r['id']),
+                    content=r['content'],
+                    source_type='lab',
+                    document_title=r['document_title'],
+                    section_title=r['section_title'],
+                    relevance_score=float(r['rank_score']),
+                    metadata=r['metadata'] or {},
+                    page_references=r['page_references'] or [],
+                    image_refs=r['image_refs'] or []
+                ))
+            
+            # Sort by relevance and return top results
+            return sorted(all_results, key=lambda x: x.relevance_score, reverse=True)[:max_results]
 ```
 
 ### Response Generation and Validation
@@ -685,6 +887,8 @@ class ResponseGenerator:
                     seen_images.add(image_ref)
         
         return images[:5]  # Limit to 5 most relevant images
+
+    
 
 # src/validation/response_validator.py
 class ResponseValidator:
@@ -1023,6 +1227,55 @@ class ResponseEngine:
         )
         
         yield {"step": "response_complete", "data": {"confidence": response.confidence_score}}
+
+    async def quick_search(self, keywords: List[str], lab_id: Optional[str] = None, 
+                        max_results: int = 10) -> Dict[str, Any]:
+        """Quick keyword search without full query processing pipeline"""
+        
+        try:
+            # Perform direct keyword search
+            search_results = await self.hybrid_retriever.quick_keyword_search(
+                keywords, lab_id, max_results
+            )
+            
+            if not search_results:
+                return {
+                    "success": False,
+                    "message": f"No results found for keywords: {', '.join(keywords)}",
+                    "suggestions": ["Try different keywords", "Check spelling"]
+                }
+            
+            # Format results for quick display
+            formatted_results = []
+            for result in search_results:
+                formatted_results.append({
+                    "content_preview": result.content[:200] + "..." if len(result.content) > 200 else result.content,
+                    "document_title": result.document_title,
+                    "section_title": result.section_title,
+                    "source_type": result.source_type,
+                    "relevance_score": round(result.relevance_score, 3),
+                    "page_references": result.page_references,
+                    "image_refs": result.image_refs
+                })
+            
+            return {
+                "success": True,
+                "results": formatted_results,
+                "total_found": len(search_results),
+                "keywords_searched": keywords,
+                "search_type": "keyword",
+                "metadata": {
+                    "lab_id": lab_id,
+                    "processing_time": None  # Add timing if needed
+                }
+            }
+            
+        except Exception as e:
+            return {
+                "success": False,
+                "error": str(e),
+                "message": "An error occurred during keyword search"
+            }
 
 # Usage Example
 async def main():
